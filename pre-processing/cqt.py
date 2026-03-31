@@ -2,50 +2,54 @@ import librosa
 import numpy as np
 import matplotlib.pyplot as plt
 
+train = open("../asvspoof5/ASVspoof5_protocols/ASVspoof5.train.tsv", "r")
+lines = train.readlines()
+train.close()
 
-file_spoofed = "../asvspoof5/flac_T/T_0000000000.flac"
-file_bonafide = "../asvspoof5/flac_T/T_0000000011.flac"
-y, sr = librosa.load(file_spoofed)
-y2, sr2 = librosa.load(file_bonafide)
-# 3. Run the default beat tracker
-# tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
-# print(f"Estimated tempo: {tempo[0]:.2f} beats per minute"
+spoofed = True
+data_count = 0
+get_data = 100
+spoofed_files = []
+bonafide_files = []
+i = 0
+while data_count < get_data :
+    if "spoof" in lines[i] and spoofed:
+        spoofed_files.append(lines[i].strip().split()[1] + ".flac")
+        spoofed = not spoofed
+        data_count += 1
+    elif "bonafide" in lines[i] and not spoofed:
+        bonafide_files.append(lines[i].strip().split()[1] + ".flac")
+        spoofed = not spoofed
+        data_count += 1
+    i += 1
 
-# Compute CQT
-C = librosa.cqt(
-    y,
-    sr=sr,
-    hop_length=512,
-    n_bins=84,
-    bins_per_octave=12
-)
+print(spoofed_files)
+print(bonafide_files)
 
-# Convert to magnitude (important!)
-C_db = librosa.amplitude_to_db(np.abs(C), ref=np.max)
+def preprocess(filenames, title):
+    res = {}
+    for filename in filenames:
+        y, sr = librosa.load(f"../asvspoof5/flac_T/{filename}", sr=16000)
 
-# Visualize
-plt.figure(figsize=(10, 4))
-librosa.display.specshow(C_db, sr=sr, x_axis='time', y_axis='cqt_note')
-plt.colorbar(format='%+2.0f dB')
-plt.title('CQT Spectrogram')
-plt.tight_layout()
-plt.show()
+        # preemphasis untuk frekuensi tinggi dimana itu
+        y = librosa.effects.preemphasis(y, coef=0.97, zi=None, return_zf=False)
 
-C = librosa.cqt(
-    y2,
-    sr=sr2,
-    hop_length=512,
-    n_bins=84,
-    bins_per_octave=12
-)
+        C = librosa.cqt(
+            y,
+            sr=sr,
+            hop_length=512,
+            n_bins=84,
+            bins_per_octave=12
+        )
 
-# Convert to magnitude (important!)
-C_db = librosa.amplitude_to_db(np.abs(C), ref=np.max)
+        # convert to magnitudde
+        res[filename] = librosa.amplitude_to_db(np.abs(C), ref=np.max)
+        save_path = f"{title}/{filename[:-5]}.npy"
+        open(save_path, 'x')
+        np.save(save_path, res[filename])
+    # with open(f"storage/{title}.txt", "x") as f:
+    #     f.write(str(res))
+    return res
 
-# Visualize
-plt.figure(figsize=(10, 4))
-librosa.display.specshow(C_db, sr=sr2, x_axis='time', y_axis='cqt_note')
-plt.colorbar(format='%+2.0f dB')
-plt.title('CQT Spectrogram')
-plt.tight_layout()
-plt.show()
+preprocessed_spoofed = preprocess(spoofed_files, "spoofed")
+preprocessed_bonafide = preprocess(bonafide_files, "bonafide")
