@@ -126,7 +126,7 @@ class ASVspoof5Dataset(Dataset):
             start = np.random.randint(0, audio.shape[1] - self.max_length + 1)
             audio = audio[:, start:start + self.max_length]
 
-        return audio, label
+        return audio.squeeze(0), label
 
 
 # ============================================================
