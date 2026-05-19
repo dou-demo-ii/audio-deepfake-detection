@@ -1,0 +1,30 @@
+find_unused_parameters: True
+## we use weights from check_multigpu_epoch_16
+# asv19 eer0.0007512734331125843,                                               
+# asv19 dcf 0.0012109795479009688
+# eer0.10467467192957133,
+# asv5 dcf 0.25353725340775146
+
+weights_path: /data/home/borodin_sam/another_workspace/AASIST3/weights/train/FINAL/model.safetensors
+
+batch_size:  128
+num_workers: 24
+shuffle: False
+max_val_batches: 10
+
+data:
+  asvspoof2021_df:
+    root_dir: /data/additional/DATASETS/audio/asvspoof2021_DF/ASVspoof2021_DF_eval/flac
+    meta_path: /data/additional/DATASETS/audio/asvspoof2021_DF/trial_metadata.txt
+
+  asvspoof2021_la:
+    root_dir: /data/additional/DATASETS/audio/ASVspoof2021_LA_eval/flac
+    meta_path: /data/additional/DATASETS/audio/ASVspoof2021_LA_eval/trial_metadata.txt
+
+  asvspoof5_test:
+    root_dir: /data/additional/DATASETS/audio/asvspoof5/flac_E_eval
+    meta_path: /data/additional/DATASETS/audio/asvspoof5/ASVspoof5.eval.track_1.tsv
+
+  asvspoof2019_eval:
+    root_dir: /data/additional/DATASETS/audio/asvspoof2019/LA/ASVspoof2019_LA_eval/flac
+    meta_path: /data/additional/DATASETS/audio/asvspoof2019/LA/ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.eval.trl.txt

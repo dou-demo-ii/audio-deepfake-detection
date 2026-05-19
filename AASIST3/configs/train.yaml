@@ -1,0 +1,62 @@
+find_unused_parameters: True
+
+num_epochs: 20
+max_train_batches: -1
+max_val_batches: -1
+gradient_accumulation_steps: 2
+
+train_batch_size: 12
+val_batch_size: 24
+num_workers: 18
+
+learning_rate: 1e-4
+
+
+comet_project_name: "antispoof"
+comet_run_name: "check_multigpu"
+workspace: "korallll"
+
+checkpoint_base_path: /data/home/borodin_sam/another_workspace/AASIST3/weights/train
+resume_from_checkpoint: /data/home/borodin_sam/another_workspace/AASIST3/weights/train/check_multigpu_epoch_5
+# resume_from_checkpoint: null
+
+data:
+  asvspoof5_train:
+    root_dir: /data/additional/DATASETS/audio/asvspoof5/flac_T
+    meta_path: /data/additional/DATASETS/audio/asvspoof5/ASVspoof5.train.metadata.txt
+
+  asvspoof2019_train:
+    root_dir: /data/additional/DATASETS/audio/asvspoof2019/LA/ASVspoof2019_LA_train/flac
+    meta_path: /data/additional/DATASETS/audio/asvspoof2019/LA/ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.train.trn.txt
+
+  mlaad:
+    root_dir: /data/additional/DATASETS/audio/MLAAD
+    # annot: ${oc.env:PROJECT_ROOT}/metadatas/mlaad.csv
+
+  m_ailabs:
+    root_dir: /data/additional/DATASETS/audio/M_AILABS
+    # annot: ${oc.env:PROJECT_ROOT}/metadatas/m_ailabs.csv
+
+  asvspoof5_dev:
+    root_dir: /data/additional/DATASETS/audio/asvspoof5/flac_D
+    meta_path: /data/additional/DATASETS/audio/asvspoof5/ASVspoof5.dev.trial.txt
+
+  asvspoof2019_dev:
+    root_dir: /data/additional/DATASETS/audio/asvspoof2019/LA/ASVspoof2019_LA_dev/flac
+    meta_path: /data/additional/DATASETS/audio/asvspoof2019/LA/ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.dev.trl.txt
+
+  asvspoof2021_df:
+    root_dir: /data/additional/DATASETS/audio/asvspoof2021_DF/ASVspoof2021_DF_eval/flac
+    meta_path: /data/additional/DATASETS/audio/asvspoof2021_DF/trial_metadata.txt
+
+  asvspoof2021_la:
+    root_dir: /data/additional/DATASETS/audio/ASVspoof2021_LA_eval/flac
+    meta_path: /data/additional/DATASETS/audio/ASVspoof2021_LA_eval/trial_metadata.txt
+
+  asvspoof5_test:
+    root_dir: /data/additional/DATASETS/audio/asvspoof5/flac_E_eval
+    meta_path: /data/additional/DATASETS/audio/asvspoof5/ASVspoof5.eval.track_1.tsv
+
+  asvspoof2019_eval:
+    root_dir: /data/additional/DATASETS/audio/asvspoof2019/LA/ASVspoof2019_LA_eval/flac
+    meta_path: /data/additional/DATASETS/audio/asvspoof2019/LA/ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.eval.trl.txt
