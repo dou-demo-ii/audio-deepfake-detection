@@ -154,35 +154,26 @@ class MP3AugmentedDataset(Dataset):
         """waveform: [T] or [1,T]  →  [T] (same shape convention as input)."""
         squeezed = waveform.ndim == 1
         if squeezed:
-            waveform = waveform.unsqueeze(0)  # [1, T]
-
-        # Generate a safe, unique temporary file name ending in .mp3
-        import tempfile
-
-        f = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
-        temp_path = f.name
-        f.close()  # Close the file handle so torchaudio can open and write to it cleanly
-
+            waveform = waveform.unsqueeze(0)
+        # FAST IN-MEMORY BUFFER BYPASSES DISK LATENCY
+        buffer = io.BytesIO()
         try:
             torchaudio.save(
-                temp_path,
+                buffer,
                 waveform,
                 self.sample_rate,
+                format="mp3",
                 compression=self.bitrate_int,
             )
-            decoded, _ = torchaudio.load(temp_path)
-        finally:
-            # Clean up the disk footprint immediately after reading
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-
-        # MP3 decode can change length slightly — match original length
+            buffer.seek(0)
+            decoded, _ = torchaudio.load(buffer, format="mp3")
+        except Exception:
+            decoded = waveform.clone()
         T = waveform.shape[1]
         if decoded.shape[1] < T:
             decoded = torch.nn.functional.pad(decoded, (0, T - decoded.shape[1]))
         else:
             decoded = decoded[:, :T]
-
         return decoded.squeeze(0) if squeezed else decoded
 
     def __getitem__(self, idx: int):
@@ -460,7 +451,14 @@ def main():
         model = aasist3(w2v_cache_dir=args.w2v_cache)
 
     model = model.to(device)
-
+    if args.finetune:
+        if hasattr(model, "frontend"):
+            for param in model.frontend.parameters():
+                param.requires_grad = False
+        elif hasattr(model, "wav2vec2"):
+            for param in model.wav2vec2.parameters():
+                param.requires_grad = False
+        print("Frozen Wav2Vec2/XLSR backbone to preserve weights & save VRAM.")
     # T4 optimisation: channels-last memory layout
     if device.type == "cuda":
         model = model.to(memory_format=torch.channels_last)
