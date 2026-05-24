@@ -2,27 +2,32 @@
 """
 AASIST3 training on ASVspoof5 — combined script.
 
-Augmentation: every sampled file is served 3×:
-  original FLAC  |  MP3 @ 128 kbps  |  MP3 @ 256 kbps
+Augmentation:
+  Every sampled file is served 3×:
+  original FLAC | MP3 @ 128 kbps | MP3 @ 256 kbps
+
+Checkpoint modes:
+  latest.pt = full checkpoint for resume training
+  best.pt   = model-only checkpoint for inference / Streamlit when --save_model_only is used
 
 Usage:
-    python train.py
-    python train.py --resume checkpoints/latest.pt
-    python train.py --max_train_samples 50000
+  python train.py
+  python train.py --resume checkpoints/latest.pt
+  python train.py --init_from_model checkpoints/best.pt
 
 Recommended Colab usage:
-    python train.py \
-      --finetune \
-      --max_train_samples 1000 \
-      --max_dev_samples 500 \
-      --epochs 1 \
-      --batch_size 1 \
-      --grad_accum 16 \
-      --lr 1e-5 \
-      --no_fp16 \
-      --save_model_only \
-      --no_epoch_snapshots \
-      --checkpoint_dir /content/checkpoints
+  python train.py \
+    --finetune \
+    --max_train_samples 1000 \
+    --max_dev_samples 500 \
+    --epochs 1 \
+    --batch_size 1 \
+    --grad_accum 16 \
+    --lr 1e-5 \
+    --no_fp16 \
+    --save_model_only \
+    --no_epoch_snapshots \
+    --checkpoint_dir /content/checkpoints
 """
 
 import argparse
@@ -393,6 +398,11 @@ def parse_args():
         help="Path to full checkpoint latest.pt to resume training.",
     )
     parser.add_argument(
+        "--init_from_model",
+        default=None,
+        help="Load model-only best.pt as initial weights, then start training from epoch 0.",
+    )
+    parser.add_argument(
         "--finetune",
         action="store_true",
         help="Load pretrained AASIST3 weights from Hugging Face before training.",
@@ -455,6 +465,9 @@ def build_train_dataset(args) -> ConcatDataset:
 
 def main():
     args = parse_args()
+
+    if args.resume and args.init_from_model:
+        raise ValueError("Use either --resume or --init_from_model, not both.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -523,6 +536,19 @@ def main():
 
     model = model.to(device)
 
+    # init from model-only best.pt
+    if args.init_from_model and os.path.exists(args.init_from_model):
+        print(f"Initialising from model-only checkpoint: {args.init_from_model}")
+
+        state_dict = torch.load(args.init_from_model, map_location=device)
+
+        if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
+            state_dict = state_dict["model_state_dict"]
+
+        model.load_state_dict(state_dict, strict=False)
+
+        print("  Loaded model weights. Training starts from epoch 0.\n")
+
     if args.finetune:
         if hasattr(model, "frontend"):
             for param in model.frontend.parameters():
@@ -555,7 +581,10 @@ def main():
     start_epoch = 0
     best_eer = float("inf")
 
-    if args.resume and os.path.exists(args.resume):
+    if args.resume:
+        if not os.path.exists(args.resume):
+            raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
+
         print(f"Resuming from {args.resume} …")
 
         ckpt = torch.load(args.resume, map_location=device)
@@ -591,6 +620,10 @@ def main():
     print(f"  LR               : {args.lr}")
     print(f"  Train items/epoch: {len(train_dataset):,}")
     print("  MP3 augmentation : 128 kbps + 256 kbps (in-memory)")
+    if args.resume:
+        print(f"  Resume from      : {args.resume}")
+    if args.init_from_model:
+        print(f"  Init from model  : {args.init_from_model}")
     print("═" * 62 + "\n")
 
     # train
@@ -642,7 +675,6 @@ def main():
         # best.pt = best model for inference / Streamlit
         if dev_eer < best_eer:
             best_eer = dev_eer
-
             best_path = os.path.join(args.checkpoint_dir, "best.pt")
 
             if args.save_model_only:
