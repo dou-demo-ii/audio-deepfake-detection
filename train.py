@@ -2,8 +2,13 @@
 """
 AASIST3 training on ASVspoof5 — T4-optimised.
 
-Augmentation: every sampled file is served 3×:
-  original FLAC  |  MP3 @ 128 kbps  |  MP3 @ 256 kbps
+Augmentation:
+  Every sampled file is served 3×:
+  original FLAC | MP3 @ 128 kbps | MP3 @ 256 kbps
+
+Checkpoint modes:
+  latest.pt = full checkpoint for resume training
+  best.pt   = model-only checkpoint for inference / Streamlit when --save_model_only is used
 
 Optimisations vs. baseline
 ──────────────────────────────────────────────────────────────────────
@@ -25,8 +30,23 @@ Usage:
     python train.py
     python train.py --finetune --cache_features   # fastest on T4
     python train.py --resume checkpoints/latest.pt
+    python train.py --init_from_model checkpoints/best.pt
     python train.py --max_train_samples 50000
     python train.py --no_compile                  # disable torch.compile
+
+Recommended Colab usage:
+  python train.py \\
+    --finetune \\
+    --max_train_samples 1000 \\
+    --max_dev_samples 500 \\
+    --epochs 1 \\
+    --batch_size 1 \\
+    --grad_accum 16 \\
+    --lr 1e-5 \\
+    --no_fp16 \\
+    --save_model_only \\
+    --no_epoch_snapshots \\
+    --checkpoint_dir /content/checkpoints
 """
 
 import argparse
@@ -47,6 +67,7 @@ from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset
 # ── locate AASIST3 source ────────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 AASIST3_DIR = os.path.join(SCRIPT_DIR, "AASIST3")
+
 if os.path.exists(AASIST3_DIR):
     sys.path.insert(0, AASIST3_DIR)
 
@@ -61,9 +82,13 @@ class ASVspoof5Dataset(Dataset):
     """
     Loads ASVspoof5 audio from its TSV protocol file.
 
-    TSV columns (space-separated):
-      SPEAKER_ID  FLAC_FILE  GENDER  CODEC  CODEC_Q  CODEC_SEED  ATTACK_TAG  ATTACK_LABEL  KEY  TMP
-    KEY (index 8): "bonafide" → label 1 | "spoof" → label 0
+    TSV columns:
+      SPEAKER_ID FLAC_FILE GENDER CODEC CODEC_Q CODEC_SEED
+      ATTACK_TAG ATTACK_LABEL KEY TMP
+
+    KEY index 8:
+      bonafide -> label 1
+      spoof    -> label 0
     """
 
     def __init__(
@@ -81,21 +106,28 @@ class ASVspoof5Dataset(Dataset):
         with open(meta_path) as f:
             for line in f:
                 parts = line.strip().split()
+
                 if len(parts) < 9:
                     continue
+
                 flac_file = parts[1] + ".flac"
-                label = 1 if parts[8] == "bonafide" else 0
+                key = parts[8]
+
+                label = 1 if key == "bonafide" else 0
                 audio_path = os.path.join(root_dir, flac_file)
+
                 self.samples.append((audio_path, label))
 
         before = len(self.samples)
         self.samples = [(p, l) for p, l in self.samples if os.path.exists(p)]
         dropped = before - len(self.samples)
+
         if dropped:
             print(f"  ⚠  {dropped} files not found on disk — skipped.")
 
-        n_bon = sum(l for _, l in self.samples)
+        n_bon = sum(label for _, label in self.samples)
         n_spo = len(self.samples) - n_bon
+
         print(
             f"  {len(self.samples):,} samples  ({n_bon:,} bonafide / {n_spo:,} spoof)"
         )
@@ -104,27 +136,38 @@ class ASVspoof5Dataset(Dataset):
         return len(self.samples)
 
     def _load(self, path: str) -> torch.Tensor:
+        """
+        Load FLAC into mono float32 tensor [1, T], resampled to self.sr.
+        """
         audio_np, sr = sf.read(path)
         audio = torch.from_numpy(audio_np).float()
         if audio.ndim == 1:
             audio = audio.unsqueeze(0)
         else:
             audio = audio.mean(dim=-1, keepdim=True).T
+
         if sr != self.sr:
             audio = torchaudio.functional.resample(audio, sr, self.sr)
+
         return audio  # [1, T]
 
     def _pad_or_crop(self, audio: torch.Tensor) -> torch.Tensor:
-        T = audio.shape[1]
-        if T < self.max_length:
-            audio = torch.nn.functional.pad(audio, (0, self.max_length - T))
-        elif T > self.max_length:
-            start = random.randint(0, T - self.max_length)
+        """
+        Make audio length fixed to self.max_length.
+        """
+        total_samples = audio.shape[1]
+
+        if total_samples < self.max_length:
+            audio = torch.nn.functional.pad(audio, (0, self.max_length - total_samples))
+        elif total_samples > self.max_length:
+            start = random.randint(0, total_samples - self.max_length)
             audio = audio[:, start : start + self.max_length]
-        return audio  # [1, max_length]
+
+        return audio
 
     def __getitem__(self, idx: int):
         path, label = self.samples[idx]
+
         try:
             audio = self._load(path)
         except Exception as e:
@@ -132,10 +175,13 @@ class ASVspoof5Dataset(Dataset):
             audio = torch.zeros(1, self.max_length)
         audio = torchaudio.functional.preemphasis(audio)
         audio = self._pad_or_crop(audio)
-        return audio.squeeze(0), label  # ([max_length], int)
+
+        return audio.squeeze(0), label
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
+# ═══════════════════════════════════════════════════════════════════════════ #
+#  MP3 augmentation wrapper                                                   #
+# ═══════════════════════════════════════════════════════════════════════════ #
 
 
 class MP3AugmentedDataset(Dataset):
@@ -144,7 +190,7 @@ class MP3AugmentedDataset(Dataset):
     audio through an in-memory MP3 encode/decode at the given bitrate.
     """
 
-    def __init__(self, dataset: Dataset, bitrate: str, sample_rate: int = 16_000):
+    def __init__(self, dataset: Dataset, bitrate: str, sample_rate: int = 16000):
         self.dataset = dataset
         self.sample_rate = sample_rate
         # torchaudio MP3 compression parameter is in bps for the ffmpeg backend
@@ -157,10 +203,17 @@ class MP3AugmentedDataset(Dataset):
         return len(self.dataset)
 
     def _mp3_roundtrip(self, waveform: torch.Tensor) -> torch.Tensor:
+        """
+        waveform: [T] or [1, T]
+        returns same shape convention as input.
+        """
         squeezed = waveform.ndim == 1
+
         if squeezed:
             waveform = waveform.unsqueeze(0)
+
         buf = io.BytesIO()
+
         try:
             torchaudio.save(
                 buf,
@@ -173,11 +226,16 @@ class MP3AugmentedDataset(Dataset):
             decoded, _ = torchaudio.load(buf, format="mp3")
         except Exception:
             decoded = waveform.clone()
-        T = waveform.shape[1]
-        if decoded.shape[1] < T:
-            decoded = torch.nn.functional.pad(decoded, (0, T - decoded.shape[1]))
+
+        target_len = waveform.shape[1]
+
+        if decoded.shape[1] < target_len:
+            decoded = torch.nn.functional.pad(
+                decoded, (0, target_len - decoded.shape[1])
+            )
         else:
-            decoded = decoded[:, :T]
+            decoded = decoded[:, :target_len]
+
         return decoded.squeeze(0) if squeezed else decoded
 
     def __getitem__(self, idx: int):
@@ -338,7 +396,9 @@ def compute_eer(scores: np.ndarray, labels: np.ndarray) -> float:
 
     fpr, tpr, _ = roc_curve(labels, scores)
     fnr = 1 - tpr
+
     idx = np.nanargmin(np.abs(fpr - fnr))
+
     return float((fpr[idx] + fnr[idx]) / 2 * 100)
 
 
@@ -358,6 +418,7 @@ def train_one_epoch(
     scaler=None,
 ):
     model.train()
+
     total_loss = 0.0
     n_batches = 0
     correct = 0
@@ -373,6 +434,7 @@ def train_one_epoch(
             with torch.autocast(device_type="cuda"):
                 outputs = model(audio)
                 loss = loss_fn(outputs, labels) / grad_accum_steps
+
             scaler.scale(loss).backward()
         else:
             outputs = model(audio)
@@ -397,6 +459,7 @@ def train_one_epoch(
 
         total_loss += loss.item() * grad_accum_steps
         n_batches += 1
+
         preds = outputs.argmax(dim=1)
         correct += (preds == labels).sum().item()
         total += labels.size(0)
@@ -416,7 +479,9 @@ def train_one_epoch(
 @torch.no_grad()
 def evaluate(model, dataloader, device, scaler=None):
     model.eval()
-    all_scores, all_labels = [], []
+
+    all_scores = []
+    all_labels = []
 
     for audio, labels in dataloader:
         audio = audio.to(device, non_blocking=True)
@@ -427,7 +492,10 @@ def evaluate(model, dataloader, device, scaler=None):
             outputs = model(audio)
 
         probs = torch.softmax(outputs, dim=1)
+
+        # class 1 = bonafide
         scores = probs[:, 1].cpu().numpy()
+
         all_scores.extend(scores)
         all_labels.extend(labels.numpy())
 
@@ -436,6 +504,7 @@ def evaluate(model, dataloader, device, scaler=None):
 
     preds = (all_scores > 0.5).astype(int)
     accuracy = (preds == all_labels).mean() * 100
+
     try:
         eer = compute_eer(all_scores, all_labels)
     except Exception:
@@ -479,35 +548,38 @@ def make_loader(dataset, batch_size, shuffle, num_workers, pin_memory):
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train AASIST3 on ASVspoof5 (T4-optimised)")
+    parser = argparse.ArgumentParser(
+        description="Train AASIST3 on ASVspoof5 (T4-optimised)"
+    )
 
     # ── paths ───────────────────────────────────────────────────────────── #
-    p.add_argument("--train_dir", default="asvspoof5/flac_T")
-    p.add_argument(
+    parser.add_argument("--train_dir", default="asvspoof5/flac_T")
+    parser.add_argument(
         "--train_meta", default="asvspoof5/ASVspoof5_protocols/ASVspoof5.train.tsv"
     )
-    p.add_argument("--dev_dir", default="asvspoof5/flac_D")
-    p.add_argument(
-        "--dev_meta", default="asvspoof5/ASVspoof5_protocols/ASVspoof5.dev.track_1.tsv"
+    parser.add_argument("--dev_dir", default="asvspoof5/flac_D")
+    parser.add_argument(
+        "--dev_meta",
+        default="asvspoof5/ASVspoof5_protocols/ASVspoof5.dev.track_1.tsv",
     )
-    p.add_argument("--checkpoint_dir", default="checkpoints")
-    p.add_argument("--w2v_cache", default="weights")
-    p.add_argument(
+    parser.add_argument("--checkpoint_dir", default="checkpoints")
+    parser.add_argument("--w2v_cache", default="weights")
+    parser.add_argument(
         "--feat_cache_dir",
         default="feat_cache",
         help="Directory for pre-extracted backbone features (--cache_features).",
     )
 
     # ── data ────────────────────────────────────────────────────────────── #
-    p.add_argument(
+    parser.add_argument(
         "--max_train_samples",
         type=int,
         default=100_000,
         help="Subset size drawn from ASVspoof5 train per epoch. "
         "Each sample is served 3× → 3× this many items/epoch.",
     )
-    p.add_argument("--max_dev_samples", type=int, default=5_000)
-    p.add_argument(
+    parser.add_argument("--max_dev_samples", type=int, default=5_000)
+    parser.add_argument(
         "--subset_seed",
         type=int,
         default=42,
@@ -515,48 +587,65 @@ def parse_args():
     )
 
     # ── training ────────────────────────────────────────────────────────── #
-    p.add_argument("--epochs", type=int, default=10)
-    p.add_argument(
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument(
         "--batch_size",
         type=int,
-        default=16,  # was 8 — T4 handles 16 comfortably with AMP + frozen backbone
+        default=16,  # T4 handles 16 comfortably with AMP + frozen backbone
         help="Per-step batch size. Effective batch = batch_size × grad_accum.",
     )
-    p.add_argument("--grad_accum", type=int, default=2)  # was 4
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--num_workers", type=int, default=4)  # was 2
+    parser.add_argument("--grad_accum", type=int, default=2)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--num_workers", type=int, default=4)
 
     # ── misc ────────────────────────────────────────────────────────────── #
-    p.add_argument(
-        "--resume", default=None, help="Path to a checkpoint (.pt) to resume from."
+    parser.add_argument(
+        "--resume", default=None, help="Path to a full checkpoint (.pt) to resume from."
     )
-    p.add_argument(
+    parser.add_argument(
+        "--init_from_model",
+        default=None,
+        help="Load model-only best.pt as initial weights, then start training from epoch 0.",
+    )
+    parser.add_argument(
         "--finetune",
         action="store_true",
         help="Load pretrained AASIST3 weights from HuggingFace and freeze backbone.",
     )
-    p.add_argument(
+    parser.add_argument(
         "--cache_features",
         action="store_true",
         help="Pre-extract frozen backbone features once and cache to disk. "
         "Only meaningful with --finetune. Fastest option on T4.",
     )
-    p.add_argument(
+    parser.add_argument(
         "--fp16",
         action="store_true",
         default=True,
         help="Use AMP (recommended for T4).",
     )
-    p.add_argument("--no_fp16", dest="fp16", action="store_false")
-    p.add_argument(
+    parser.add_argument("--no_fp16", dest="fp16", action="store_false")
+    parser.add_argument(
         "--compile",
         action="store_true",
         default=True,
         help="torch.compile the model (PyTorch ≥ 2.0). ~+15-25%% on T4.",
     )
-    p.add_argument("--no_compile", dest="compile", action="store_false")
+    parser.add_argument("--no_compile", dest="compile", action="store_false")
 
-    return p.parse_args()
+    # ── checkpoint control ──────────────────────────────────────────────── #
+    parser.add_argument(
+        "--save_model_only",
+        action="store_true",
+        help="Save best.pt as model.state_dict() only, without optimizer state.",
+    )
+    parser.add_argument(
+        "--no_epoch_snapshots",
+        action="store_true",
+        help="Disable epoch_000.pt, epoch_001.pt snapshots.",
+    )
+
+    return parser.parse_args()
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #
@@ -574,6 +663,7 @@ def build_train_dataset(args, base: ASVspoof5Dataset, epoch: int = 0) -> ConcatD
     n = min(args.max_train_samples, len(base))
     rng = random.Random(args.subset_seed + epoch)
     indices = rng.sample(range(len(base)), n)
+
     subset = Subset(base, indices)
 
     original = subset
@@ -590,6 +680,9 @@ def build_train_dataset(args, base: ASVspoof5Dataset, epoch: int = 0) -> ConcatD
 
 def main():
     args = parse_args()
+
+    if args.resume and args.init_from_model:
+        raise ValueError("Use either --resume or --init_from_model, not both.")
 
     # ── device & AMP ────────────────────────────────────────────────────── #
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -612,6 +705,7 @@ def main():
 
     print("── Dev data ───────────────────────────────────────────────────")
     dev_base = ASVspoof5Dataset(root_dir=args.dev_dir, meta_path=args.dev_meta)
+
     if args.max_dev_samples and args.max_dev_samples < len(dev_base):
         rng_dev = random.Random(args.subset_seed)
         dev_idx = rng_dev.sample(range(len(dev_base)), args.max_dev_samples)
@@ -639,6 +733,15 @@ def main():
 
     model = model.to(device)
 
+    # Optionally initialise weights from a model-only best.pt
+    if args.init_from_model and os.path.exists(args.init_from_model):
+        print(f"Initialising from model-only checkpoint: {args.init_from_model}")
+        state_dict = torch.load(args.init_from_model, map_location=device)
+        if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
+            state_dict = state_dict["model_state_dict"]
+        model.load_state_dict(state_dict, strict=False)
+        print("  Loaded model weights. Training starts from epoch 0.\n")
+
     # Freeze backbone when fine-tuning
     if args.finetune:
         frozen_module = None
@@ -659,8 +762,6 @@ def main():
     if args.compile:
         if hasattr(torch, "compile"):
             print("  Compiling model (reduce-overhead) …")
-            # Disable compilation for the frozen backbone sub-module if found;
-            # compile only the trainable part to reduce warm-up time.
             model = torch.compile(model, mode="reduce-overhead")
             print("  ✓ torch.compile done (first forward will trigger JIT warm-up)")
         else:
@@ -668,6 +769,7 @@ def main():
 
     n_total = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
     print(f"  {n_total:,} total params  |  {n_trainable:,} trainable\n")
 
     # ── optimiser & loss ────────────────────────────────────────────────── #
@@ -675,8 +777,9 @@ def main():
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.lr,
         eps=1e-7,
-        weight_decay=1e-4,  # slight regularisation; was 0
+        weight_decay=1e-4,  # slight regularisation
     )
+
     loss_fn = nn.CrossEntropyLoss()
 
     # OneCycleLR: one cycle spanning the full training run.
@@ -699,18 +802,30 @@ def main():
     start_epoch = 0
     best_eer = float("inf")
 
-    if args.resume and os.path.exists(args.resume):
+    if args.resume:
+        if not os.path.exists(args.resume):
+            raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
+
         print(f"Resuming from {args.resume} …")
         ckpt = torch.load(args.resume, map_location=device)
-        model.load_state_dict(ckpt["model_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        start_epoch = ckpt.get("epoch", 0) + 1
-        best_eer = ckpt.get("best_eer", float("inf"))
-        if scaler and "scaler_state_dict" in ckpt:
-            scaler.load_state_dict(ckpt["scaler_state_dict"])
-        if "scheduler_state_dict" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        print(f"  Resumed at epoch {start_epoch}  (best EER so far: {best_eer:.2f}%)\n")
+
+        if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+            model.load_state_dict(ckpt["model_state_dict"])
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            start_epoch = ckpt.get("epoch", 0) + 1
+            best_eer = ckpt.get("best_eer", float("inf"))
+            if scaler and "scaler_state_dict" in ckpt:
+                scaler.load_state_dict(ckpt["scaler_state_dict"])
+            if "scheduler_state_dict" in ckpt:
+                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            print(
+                f"  Resumed at epoch {start_epoch}  (best EER so far: {best_eer:.2f}%)\n"
+            )
+        else:
+            raise ValueError(
+                "Resume requires a full checkpoint with model_state_dict and "
+                "optimizer_state_dict. Do not resume from model-only best.pt."
+            )
 
     # ── feature cache (frozen backbone only) ────────────────────────────── #
     use_feat_cache = args.cache_features and args.finetune
@@ -764,11 +879,16 @@ def main():
     print(f"  MP3 augmentation  : 128 kbps + 256 kbps (in-memory)")
     print(f"  Feature cache     : {'ON' if use_feat_cache else 'OFF'}")
     print(f"  Per-epoch reshuffle: {'OFF (feat cache)' if use_feat_cache else 'ON'}")
+    if args.resume:
+        print(f"  Resume from       : {args.resume}")
+    if args.init_from_model:
+        print(f"  Init from model   : {args.init_from_model}")
     print("═" * 64 + "\n")
 
     # ── training loop ───────────────────────────────────────────────────── #
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
+
         print(f"Epoch {epoch + 1}/{args.epochs}")
 
         # Build (or reuse) training dataset
@@ -799,9 +919,15 @@ def main():
             scaler=scaler,
         )
 
-        dev_acc, dev_eer = evaluate(model, dev_loader, device, scaler=scaler)
+        dev_acc, dev_eer = evaluate(
+            model=model,
+            dataloader=dev_loader,
+            device=device,
+            scaler=scaler,
+        )
 
         elapsed = time.time() - t0
+
         print(
             f"  loss {avg_loss:.4f} │ "
             f"train acc {train_acc:.1f}% │ "
@@ -825,22 +951,32 @@ def main():
             "dev_eer": dev_eer,
             "best_eer": best_eer,
         }
+
         if scaler:
             ckpt["scaler_state_dict"] = scaler.state_dict()
 
+        # latest.pt = full checkpoint for resume
         torch.save(ckpt, os.path.join(args.checkpoint_dir, "latest.pt"))
-        torch.save(ckpt, os.path.join(args.checkpoint_dir, f"epoch_{epoch:03d}.pt"))
 
+        # optional per-epoch snapshot
+        if not args.no_epoch_snapshots:
+            torch.save(ckpt, os.path.join(args.checkpoint_dir, f"epoch_{epoch:03d}.pt"))
+
+        # best.pt = best model for inference / Streamlit
         if dev_eer < best_eer:
             best_eer = dev_eer
             ckpt["best_eer"] = best_eer
-            torch.save(ckpt, os.path.join(args.checkpoint_dir, "best.pt"))
+            best_path = os.path.join(args.checkpoint_dir, "best.pt")
+            if args.save_model_only:
+                torch.save(raw_model.state_dict(), best_path)
+            else:
+                torch.save(ckpt, best_path)
             print(f"  ★ New best EER: {best_eer:.2f}%  → saved best.pt")
 
         print()
 
-    print(f"Done.  Best EER: {best_eer:.2f}%")
-    print(f"Checkpoints in : {args.checkpoint_dir}/")
+    print(f"Done. Best EER: {best_eer:.2f}%")
+    print(f"Checkpoints in: {args.checkpoint_dir}/")
 
 
 if __name__ == "__main__":
